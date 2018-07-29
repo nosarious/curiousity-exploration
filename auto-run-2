@@ -1,0 +1,300 @@
+# 
+# this is a program to read GPS data and the information from several other sensors
+#
+# this will be stored in a file that can later be parsed to make artwork
+#
+# tentativly called A Walk In The Park or Inadequate Descriptions
+#
+
+#### setup
+####
+#### this file includes code from several sources.
+
+import time
+import datetime
+import grovepi
+import math
+import serial
+import re
+import sys
+from Adafruit_BME280 import *
+import Adafruit_GPIO.I2C as I2C
+
+en_debug = True
+def debug(in_str):
+	if en_debug:
+		print(in_str)
+		
+
+if sys.platform == 'uwp':
+    import winrt_smbus as smbus
+    bus = smbus.SMBus(1)
+else:
+    import smbus
+    import RPi.GPIO as GPIO
+    rev = GPIO.RPI_REVISION
+    if rev == 2 or rev == 3:
+        bus = smbus.SMBus(1)
+    else:
+        bus = smbus.SMBus(0)
+
+
+import RPi.GPIO as GPIO
+rev = GPIO.RPI_REVISION
+if rev == 2 or rev == 3:
+    bus = smbus.SMBus(1)
+else:
+    bus = smbus.SMBus(0)
+
+#### Getting the barometer sensor information - requires installing Adafruit GPIO library
+sensor = BME280(t_mode=BME280_OSAMPLE_8, p_mode=BME280_OSAMPLE_8, h_mode=BME280_OSAMPLE_8)
+
+#### prep the serial for the gps 
+ser = serial.Serial('/dev/ttyAMA0',  9600, timeout = 0.1)	#Open the serial port at 9600 baud
+ser.flush()
+
+################## start of functions ########################
+#Theoretically this is supposed to grab GPS coordinates. 
+def readlineCR():
+    rv = ""
+    while True:
+        time.sleep(0.001)	# This is the critical part.  A small pause 
+        					# works really well here.
+        ch = ser.read()        
+        rv += ch
+        if ch=='\r' or ch=='':
+            return rv
+ 
+class GPS:
+	#The GPS module used is a Grove GPS module http://www.seeedstudio.com/depot/Grove-GPS-p-959.html
+	inp=[]
+	# Refer to SIM28 NMEA spec file http://www.seeedstudio.com/wiki/images/a/a0/SIM28_DATA_File.zip
+	GGA=[]
+ 
+	#Read data from the GPS
+	def read(self):	
+		while True:
+			GPS.inp=ser.readline().decode()
+			#GPS.inp = readlineCR().strip()
+			if GPS.inp[:6] =='$GPGGA': # GGA data , packet 1, has all the data we need
+                                #print("got the data")
+                                break
+			time.sleep(0.1)
+		try:
+			ind=GPS.inp.index('$GPGGA',5,len(GPS.inp))	#Sometimes multiple GPS data packets come into the stream. Take the data only after the last '$GPGGA' is seen
+			GPS.inp=GPS.inp[ind:]
+		except ValueError:
+			print ("")
+		GPS.GGA=GPS.inp.split(",")	#Split the stream into individual parts
+		return [GPS.GGA]
+ 
+	#Split the data into individual elements
+	def vals(self):
+		time=GPS.GGA[1]
+		lat=GPS.GGA[2]
+		lat_ns=GPS.GGA[3]
+		long=GPS.GGA[4]
+		long_ew=GPS.GGA[5]
+		fix=GPS.GGA[6]
+		sats=GPS.GGA[7]
+		alt=GPS.GGA[9]
+		return [time,fix,sats,alt,lat,lat_ns,long,long_ew]
+	    
+	    
+# this device has two I2C addresses
+DISPLAY_RGB_ADDR = 0x62
+DISPLAY_TEXT_ADDR = 0x3e
+
+# set backlight to (R,G,B) (values from 0..255 for each)
+def setRGB(r,g,b):
+    bus.write_byte_data(DISPLAY_RGB_ADDR,0,0)
+    bus.write_byte_data(DISPLAY_RGB_ADDR,1,0)
+    bus.write_byte_data(DISPLAY_RGB_ADDR,0x08,0xaa)
+    bus.write_byte_data(DISPLAY_RGB_ADDR,4,r)
+    bus.write_byte_data(DISPLAY_RGB_ADDR,3,g)
+    bus.write_byte_data(DISPLAY_RGB_ADDR,2,b)
+
+# send command to display (no need for external use)    
+def textCommand(cmd):
+    bus.write_byte_data(DISPLAY_TEXT_ADDR,0x80,cmd)
+
+# set display text \n for second line(or auto wrap)     
+def setText(text):
+    textCommand(0x01) # clear display
+    time.sleep(.05)
+    textCommand(0x08 | 0x04) # display on, no cursor
+    textCommand(0x28) # 2 lines
+    time.sleep(.05)
+    count = 0
+    row = 0
+    for c in text:
+        if c == '\n' or count == 16:
+            count = 0
+            row += 1
+            if row == 2:
+                break
+            textCommand(0xc0)
+            if c == '\n':
+                continue
+        count += 1
+        bus.write_byte_data(DISPLAY_TEXT_ADDR,0x40,ord(c))
+
+#Update the display without erasing the display
+def setText_norefresh(text):
+    textCommand(0x02) # return home
+    time.sleep(.05)
+    textCommand(0x08 | 0x04) # display on, no cursor
+    textCommand(0x28) # 2 lines
+    time.sleep(.05)
+    count = 0
+    row = 0
+    while len(text) < 32: #clears the rest of the screen
+        text += ' '
+    for c in text:
+        if c == '\n' or count == 16:
+            count = 0
+            row += 1
+            if row == 2:
+                break
+            textCommand(0xc0)
+            if c == '\n':
+                continue
+        count += 1
+        bus.write_byte_data(DISPLAY_TEXT_ADDR,0x40,ord(c))
+
+# Create a custom character (from array of row patterns)
+def create_char(location, pattern):
+    location &= 0x07 # Make sure location is 0-7
+    textCommand(0x40 | (location << 3))
+    bus.write_i2c_block_data(DISPLAY_TEXT_ADDR, 0x40, pattern)
+ 
+ 
+
+
+################## end of functions ########################
+
+
+#	### start
+
+fileWrite = False 		# if file is being written
+bButtonChange = False 	#  boolean for holding the button press change
+button_old = 0
+button_new = 0
+light_sensor = 0		#sound sensor on A0
+#gas_sensor = 1#gas sensor
+sound_sensor = 2		#light sensor on A2
+timeStart = 0
+
+temp_hum_sensor = 4		#temp/humidity on D4
+#	sensor type for temp/humidity
+blue = 0
+white = 1
+
+# Connect the Grove Button to digital port D3
+# SIG,NC,VCC,GND
+button_port = 3
+grovepi.pinMode(button_port,"INPUT")
+button_now = False
+
+################### start of main loop #####################
+
+if __name__ == "__main__":
+    fileWrite = False
+    setText(" start - nothing written")
+    g=GPS()
+    start_time = 0
+    elapsed_value = 0
+    while True:
+        try:
+            #### prep button values to see if it has changed
+            button_old = button_now
+            button_now = grovepi.digitalRead(button_port)
+        
+            if button_now == 1 and button_old != button_now:
+                if fileWrite == True:
+                    if elapsed_value > 10:
+                        print("closing the file")
+                        f.close()
+                        fileWrite = False
+                        setRGB(0,255,0)
+                        setText("waitng")
+                    else:
+                        print("can't close yet, too soon")
+                        setText("can't close yet - too soon")
+                else:
+                    #if button_old!= button_new:
+                        fileWrite = True
+                        print ("opening the file")
+                        setText ("recording data")
+                # if now true, open file, start recording
+		### find the time to use for the file name
+                        start_time = time.time()
+                        st = datetime.datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')+".csv"
+                ### Open file to log the data
+                        f=open(st,'w')
+                        f.write("time,light,sound,temp,humidity,degrees,hectopascals,humidity,sat-time,latitude,longitude,altitude\n")	#Write the header to the top of the file
+                    #else:
+                    #    print("cannot change - button still held down")
+                    # main loop of readinng and writing
+                #if button_old == button_now:
+            else:
+                if fileWrite == True:
+                    setRGB(0,255,0)
+                    elapsed_value = time.time()-start_time
+                    elapsed_time = str("%.0f" % elapsed_value)
+                    setText("writing "+elapsed_time)
+                # read GPS information
+                #get the GPS data, or return 'bno data' if there is none
+                    try:
+                        x=g.read()	#Read from GPS
+                        #### the rest only happens if there is valid GPS info
+                        [t,fix,sats,alt,lat,lat_ns,long,long_ew]=g.vals()	#Get the individial values
+                        print ("Time:",t,"Fix status:",fix,"Sats in view:",sats,"Altitude",alt,"Lat:",lat,lat_ns,"Long:",long,long_ew)
+                        gps_string=str(t)+","+str(float(lat)/100)+","+str(float(long)/100)+","+str(alt)+"\n"
+                        
+                        #get the barmeter information
+                        degrees = sensor.read_temperature()
+                        pascals = sensor.read_pressure()
+                        hectopascals = (pascals / 100)
+                        humidity = sensor.read_humidity()
+		            
+		            #print ('Temp      = {0:0.3f} deg C'.format(degrees))
+		            #print ('Pressure  = {0:0.2f} hPa'.format(hectopascals))
+		            #print ('Humidity  = {0:0.2f} %'.format(humidity))
+                        bar_string = str("%.2f" % degrees)+","+str("%.2f" % hectopascals)+","+str("%.2f" % humidity)
+		            
+                            ### sensor 0 = sound. Sensor2 = light
+		            ### note: this has to be done in a specific before digital sensors
+		            ### otherwise values are identical
+                        sound_value = grovepi.analogRead(sound_sensor)
+                        #gas_value = grovepi_analogRead(gas_sensor)
+                        light_value = grovepi.analogRead(light_sensor)
+                            
+		            ### emperature sensor data just incase no info
+                        temperatureV = 0
+                        humidityV = 0
+                            
+                        [temp,humidity] = grovepi.dht(temp_hum_sensor,blue)
+                        
+                        if math.isnan(temp) == False and math.isnan(humidity) == False:
+                                #print("temp = %.02f C humidity = %.02f%%" %(temp, humidity))
+                            temperatureV = temp
+                            humidityV = humidity
+                                
+                                ### construct the string to save to file
+                            savetext=str(elapsed_time)+","+str(light_value)+","+str(sound_value)+","+str(temperatureV)+","+str(humidityV)+","+bar_string+","+gps_string+"\n"
+                            debug(savetext)
+                            f.write(savetext)	#Save to file
+
+                    except:
+                        print("no GPS data")
+                
+                    
+                    
+        except IOError:
+                print("error")
+        except KeyboardInterrupt:
+                f.close()
+                setText("")
+                print ("Exiting")
+
